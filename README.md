@@ -8,6 +8,7 @@
  * 
  * Copyright (c) 2025 by bowen-xu link.bowenxu@connect.hku.hk, All Rights Reserved. 
 -->
+这是一个基于 FAPP (https://github.com/arclab-hku/FAPP) 修改的版本。添加了交互式多模型（IMM）运动预测和速度障碍（VO）动态避障代价。
 <div align = "center">
   <h1>
     FAPP 
