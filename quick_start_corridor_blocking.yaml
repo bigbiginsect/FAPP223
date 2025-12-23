@@ -1,0 +1,15 @@
+session_name: fapp_corridor_blocking
+windows:
+  - window_name: fapp_corridor_blocking
+    layout: tiled
+    shell_command_before:
+      - source devel/setup.bash
+    panes:
+      - shell_command:
+          - roslaunch so3_quadrotor_simulator simulator_corridor_blocking.launch 
+      - shell_command:
+          - sleep 2
+          - roslaunch fapp_planner sim_test_corridor_blocking.launch
+      - shell_command:
+          - sleep 2
+          - roslaunch mot_mapping sim_mapping.launch

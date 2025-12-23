@@ -1316,7 +1316,7 @@ namespace fapp_planner
           costs(1) += omg * step * costp;
         }
         
-        // objects
+        // objects - distance-based cost (original)
         gradp.setZero();
         costp = 0;
         gradt = 0;
@@ -1334,6 +1334,22 @@ namespace fapp_planner
             gradp += 8000 * 3 * dist * dist * (-2) * (pos - obj_pos);
             gradt += 8000 * 3 * dist * dist * (-2) * (pos - obj_pos).dot(vel - obj_vel);
             grad_prev_t += 8000 * 3 * dist * dist * (-2) * ((pos - obj_pos).head(2)).dot(-(obj_vel).head(2));
+          }
+          
+          // ================== Velocity Obstacle Cost (Innovation) ==================
+          // Additionally apply VO-based cost for approaching objects
+          if (use_vo_)
+          {
+            Eigen::Vector3d vo_gradp, vo_gradv;
+            double vo_costp;
+            if (velocityObstacleGradCost(pos, vel, obj_pos, obj_vel, vo_clearance_, vo_gradp, vo_gradv, vo_costp))
+            {
+              costp += vo_costp;
+              gradp += vo_gradp;
+              // VO also affects velocity, which contributes to time gradient
+              gradt += vo_gradv.dot(acc);  // dC/dv * dv/dt = dC/dv * acc
+              grad_prev_t += vo_gradv.dot(-obj_vel);  // Effect of object velocity
+            }
           }
         }
         gradp(2) = 0;
@@ -1661,6 +1677,17 @@ namespace fapp_planner
     nh.param("optimization/max_vel", max_vel_, -1.0);
     nh.param("optimization/max_acc", max_acc_, -1.0);
     nh.param("optimization/max_jer", max_jer_, -1.0);
+    
+    // Velocity Obstacle parameters (Innovation)
+    nh.param("optimization/use_velocity_obstacle", use_vo_, true);
+    nh.param("optimization/weight_velocity_obstacle", wei_vo_, 5000.0);
+    nh.param("optimization/vo_clearance", vo_clearance_, 1.4);
+    nh.param("optimization/vo_horizon", vo_horizon_, 3.0);
+    
+    if (use_vo_) {
+      ROS_INFO("[VO] Velocity Obstacle avoidance enabled (weight=%.1f, clearance=%.2f, horizon=%.2f)",
+               wei_vo_, vo_clearance_, vo_horizon_);
+    }
   }
 
   void PolyTrajOptimizer::setEnvironment(const GridMap::Ptr &map)
@@ -1686,5 +1713,142 @@ namespace fapp_planner
   void PolyTrajOptimizer::setConstraintPoints(ConstraintPoints cps) { cps_ = cps; }
 
   void PolyTrajOptimizer::setUseMultitopologyTrajs(bool use_multitopology_trajs) { multitopology_data_.use_multitopology_trajs = use_multitopology_trajs; }
+
+  // ================== Velocity Obstacle Implementation (Innovation) ==================
+  
+  /**
+   * @brief Compute time-to-collision using the Velocity Obstacle method
+   * 
+   * Solves the quadratic equation: |rel_pos + t * rel_vel|^2 = radius^2
+   * Which expands to: |rel_vel|^2 * t^2 + 2*(rel_pos . rel_vel)*t + |rel_pos|^2 - radius^2 = 0
+   */
+  double PolyTrajOptimizer::computeTimeToCollision(
+      const Eigen::Vector3d &rel_pos,
+      const Eigen::Vector3d &rel_vel,
+      const double radius)
+  {
+    // Consider only XY plane for 2.5D navigation
+    Eigen::Vector2d rel_pos_2d = rel_pos.head(2);
+    Eigen::Vector2d rel_vel_2d = rel_vel.head(2);
+    
+    double a = rel_vel_2d.squaredNorm();
+    double b = 2.0 * rel_pos_2d.dot(rel_vel_2d);
+    double c = rel_pos_2d.squaredNorm() - radius * radius;
+    
+    // If velocity is near zero, no collision will occur
+    if (a < 1e-6) {
+      return -1.0;  // No collision
+    }
+    
+    double discriminant = b * b - 4.0 * a * c;
+    
+    // No real solutions means no collision
+    if (discriminant < 0) {
+      return -1.0;
+    }
+    
+    double sqrt_disc = std::sqrt(discriminant);
+    double t1 = (-b - sqrt_disc) / (2.0 * a);
+    double t2 = (-b + sqrt_disc) / (2.0 * a);
+    
+    // We want the smallest positive time
+    if (t1 > 0) {
+      return t1;
+    } else if (t2 > 0) {
+      return t2;
+    }
+    
+    return -1.0;  // Collision already happened or won't happen
+  }
+
+  /**
+   * @brief Compute Velocity Obstacle based avoidance cost and gradient
+   * 
+   * The cost function penalizes trajectories that would lead to collision
+   * based on the time-to-collision. The closer the collision, the higher the cost.
+   * 
+   * Cost = wei_vo * (1/tau)^2 for tau < vo_horizon
+   * 
+   * The gradient pushes the UAV velocity away from the VO cone.
+   */
+  bool PolyTrajOptimizer::velocityObstacleGradCost(
+      const Eigen::Vector3d &uav_pos,
+      const Eigen::Vector3d &uav_vel,
+      const Eigen::Vector3d &obj_pos,
+      const Eigen::Vector3d &obj_vel,
+      const double collision_radius,
+      Eigen::Vector3d &gradp,
+      Eigen::Vector3d &gradv,
+      double &costp)
+  {
+    gradp.setZero();
+    gradv.setZero();
+    costp = 0.0;
+    
+    // Relative position and velocity
+    Eigen::Vector3d rel_pos = uav_pos - obj_pos;
+    Eigen::Vector3d rel_vel = uav_vel - obj_vel;
+    
+    // Compute time-to-collision
+    double tau = computeTimeToCollision(rel_pos, rel_vel, collision_radius);
+    
+    // If no collision or collision too far in future, no cost
+    if (tau < 0 || tau > vo_horizon_) {
+      return false;
+    }
+    
+    // Minimum tau to avoid division by very small numbers
+    tau = std::max(tau, 0.1);
+    
+    // Cost: penalize more heavily as tau decreases
+    // Using 1/tau^2 provides strong repulsion for imminent collisions
+    double inv_tau = 1.0 / tau;
+    double inv_tau_sq = inv_tau * inv_tau;
+    
+    costp = wei_vo_ * inv_tau_sq;
+    
+    // Compute gradient with respect to relative velocity
+    // d(tau)/d(rel_vel) affects the cost through the chain rule
+    
+    // For 2D (XY plane):
+    Eigen::Vector2d rel_pos_2d = rel_pos.head(2);
+    Eigen::Vector2d rel_vel_2d = rel_vel.head(2);
+    
+    double a = rel_vel_2d.squaredNorm();
+    double b = 2.0 * rel_pos_2d.dot(rel_vel_2d);
+    
+    if (a > 1e-6) {
+      // Gradient of tau w.r.t. relative velocity (for the smaller root)
+      double discriminant = b * b - 4.0 * a * (rel_pos_2d.squaredNorm() - collision_radius * collision_radius);
+      if (discriminant > 1e-6) {
+        double sqrt_disc = std::sqrt(discriminant);
+        
+        // Derivative of tau_1 = (-b - sqrt(disc)) / (2a)
+        // d(tau)/d(rel_vel) = d(tau)/d(a) * d(a)/d(rel_vel) + d(tau)/d(b) * d(b)/d(rel_vel) + d(tau)/d(disc) * d(disc)/d(rel_vel)
+        
+        // Simplified gradient: push velocity perpendicular to VO cone
+        // This is a practical approximation that works well in practice
+        Eigen::Vector2d collision_dir = (rel_pos_2d + tau * rel_vel_2d).normalized();
+        
+        // Gradient direction: perpendicular to collision direction, away from object
+        Eigen::Vector2d grad_vo_2d;
+        if (rel_pos_2d.dot(rel_vel_2d) < 0) {
+          // Object is approaching - push velocity perpendicular to approach direction
+          grad_vo_2d = -wei_vo_ * 2.0 * inv_tau_sq * inv_tau * collision_dir;
+        } else {
+          // Object is receding - minimal gradient
+          grad_vo_2d = -wei_vo_ * 0.5 * inv_tau_sq * inv_tau * collision_dir;
+        }
+        
+        // Also add position gradient to increase separation
+        Eigen::Vector2d grad_pos_2d = -wei_vo_ * inv_tau_sq * rel_pos_2d.normalized();
+        
+        gradp.head(2) = grad_pos_2d;
+        gradv.head(2) = grad_vo_2d;
+      }
+    }
+    
+    return true;
+  }
 
 } // namespace fapp_planner

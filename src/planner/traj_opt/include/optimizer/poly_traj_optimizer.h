@@ -104,6 +104,12 @@ namespace fapp_planner
     double max_vel_, max_acc_, max_jer_;                          // dynamic limits
 
     double t_now_;
+    
+    // Velocity Obstacle parameters (Innovation)
+    double wei_vo_;           // Velocity Obstacle weight
+    double vo_clearance_;     // VO collision radius
+    double vo_horizon_;       // VO prediction horizon
+    bool use_vo_;             // Enable VO-based avoidance
 
   public:
     PolyTrajOptimizer() {}
@@ -215,6 +221,51 @@ namespace fapp_planner
                                       const int n,
                                       Eigen::MatrixXd &gdp,
                                       double &var);
+
+    // ================== Velocity Obstacle Cost (Innovation) ==================
+    /**
+     * @brief Compute Velocity Obstacle based avoidance cost and gradient
+     * 
+     * Innovation: Instead of using simple distance-based collision checking,
+     * we use Velocity Obstacles which consider the relative velocity between
+     * the UAV and dynamic objects. This provides more intelligent avoidance
+     * that naturally steers away from objects moving towards the UAV.
+     * 
+     * The VO cone is defined by the relative position and collision radius.
+     * If the relative velocity falls inside this cone, a collision will occur
+     * at some future time (time-to-collision).
+     * 
+     * @param uav_pos Current UAV position
+     * @param uav_vel Current UAV velocity  
+     * @param obj_pos Dynamic object position
+     * @param obj_vel Dynamic object velocity
+     * @param collision_radius Combined collision radius
+     * @param gradp Output gradient w.r.t. position
+     * @param gradv Output gradient w.r.t. velocity (for time gradient)
+     * @param costp Output cost value
+     * @return true if VO constraint is active (potential collision detected)
+     */
+    bool velocityObstacleGradCost(
+        const Eigen::Vector3d &uav_pos,
+        const Eigen::Vector3d &uav_vel,
+        const Eigen::Vector3d &obj_pos,
+        const Eigen::Vector3d &obj_vel,
+        const double collision_radius,
+        Eigen::Vector3d &gradp,
+        Eigen::Vector3d &gradv,
+        double &costp);
+
+    /**
+     * @brief Compute time-to-collision for Velocity Obstacle
+     * @param rel_pos Relative position (uav - obj)
+     * @param rel_vel Relative velocity (uav_vel - obj_vel)
+     * @param radius Combined collision radius
+     * @return Time to collision, negative if no collision will occur
+     */
+    double computeTimeToCollision(
+        const Eigen::Vector3d &rel_pos,
+        const Eigen::Vector3d &rel_vel,
+        const double radius);
 
   public:
     typedef unique_ptr<PolyTrajOptimizer> Ptr;

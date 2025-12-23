@@ -31,3 +31,14 @@ add_executable (random_forest src/random_forest_sensing.cpp )
 target_link_libraries(random_forest
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES})
+
+add_executable (corridor_bidirectional src/corridor_bidirectional.cpp )
+target_link_libraries(corridor_bidirectional
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES})
+
+add_executable (corridor_blocking src/corridor_blocking.cpp )
+target_link_libraries(corridor_blocking
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES})
+

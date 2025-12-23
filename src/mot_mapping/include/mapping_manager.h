@@ -40,6 +40,7 @@
 #include "DBSCAN_kdtree.h"
 #include "Hungarian.h"
 #include "target_ekf.hpp"
+#include "imm_estimator.hpp"  // IMM multi-model estimator (Innovation)
 #include "ikd_Tree.h"
 #include "ikd_Tree_impl.h"
 
@@ -64,6 +65,8 @@ struct MapParam {
   // ROS Params
   std::string odom_topic;
   std::string lidar_topic;
+  // IMM Estimator Params (Innovation)
+  bool use_imm;  // Use IMM instead of simple EKF
 };
 
 struct MapData {
@@ -98,7 +101,10 @@ private:
   std::vector<pcl::PointIndices> deleted_indices;
   std::vector<BoxPointType> delete_boxes;
 
-  std::vector<std::shared_ptr<Ekf>> trackers;
+  // Original EKF trackers (deprecated, kept for compatibility)
+  std::vector<std::shared_ptr<Ekf>> trackers_ekf;
+  // IMM (Interacting Multiple Model) trackers (Innovation)
+  std::vector<std::shared_ptr<IMMEstimator>> trackers_imm;
   std::vector<ObjectState> detections;
 
   ros::Time t_start;

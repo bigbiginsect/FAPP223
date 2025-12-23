@@ -28,6 +28,14 @@ void MappingRos::init() {
   nh.param("lidar/range_z", mp_->Range[2], 1.0);
   nh.param("ros/odom_topic", mp_->odom_topic, string("/odom"));
   nh.param("ros/lidar_topic", mp_->lidar_topic, string("/livox/lidar"));
+  // IMM Estimator parameter (Innovation: use multi-model tracking)
+  nh.param("tracking/use_imm", mp_->use_imm, true);  // Default to IMM
+  
+  if (mp_->use_imm) {
+    std::cout << "[IMM] Using Interacting Multiple Model estimator (CV+CA+CT)" << std::endl;
+  } else {
+    std::cout << "[EKF] Using simple Constant Velocity EKF" << std::endl;
+  }
 
   cloudPub = nh.advertise<sensor_msgs::PointCloud2>("/dynamic_points", 10);
   mapPub = nh.advertise<sensor_msgs::PointCloud2>("/map_ros", 10);
@@ -333,92 +341,184 @@ void MappingRos::cloudOdomCallback(const sensor_msgs::PointCloud2ConstPtr& msg,
   dynamic_pts.header.frame_id = "world";
   cloudPub.publish(dynamic_pts);
 
-  // Tracking & EKF
-  if(trackers.size() == 0) {
-    for(int i = 0; i < detections.size(); ++i) {
-      std::shared_ptr<Ekf> ekfPtr = std::make_shared<Ekf>(0.02);
-      ekfPtr->reset(detections[i].position, id);
-      id++;
-      trackers.push_back(ekfPtr);
-      previous_p.push_back(detections[i].position);
-      Eigen::Vector3d v0(0,0,0);
-      previous_v.push_back(v0);
+  // ========== Tracking with IMM or EKF ==========
+  // Innovation: Use Interacting Multiple Model (IMM) estimator for better motion prediction
+  if (mp_->use_imm) {
+    // IMM Tracking
+    if(trackers_imm.size() == 0) {
+      for(size_t i = 0; i < detections.size(); ++i) {
+        std::shared_ptr<IMMEstimator> immPtr = std::make_shared<IMMEstimator>(0.02);
+        immPtr->reset(detections[i].position, id);
+        id++;
+        trackers_imm.push_back(immPtr);
+        previous_p.push_back(detections[i].position);
+        Eigen::Vector3d v0(0,0,0);
+        previous_v.push_back(v0);
+      }
+      return;
     }
-    return;
-  }
 
+    obj_state_msgs::ObjectsStates states;
+    std::vector<std::pair<int, int>> matchedPairs;
 
-  obj_state_msgs::ObjectsStates states;
-  std::vector<std::pair<int, int>> matchedPairs;
+    for (size_t i = 0; i < detections.size(); ++i) {
+      double min_dist = 1000000;
+      int min_index = -1;
+      Eigen::Vector3d det_pos = detections[i].position;
+      for (size_t j = 0; j < trackers_imm.size(); ++j) {
+        trackers_imm[j]->age = trackers_imm[j]->age + 1;
+        Eigen::Vector3d track_pos = trackers_imm[j]->pos();
+        double dist = (det_pos - track_pos).norm();
+        if (dist < min_dist) {
+          min_dist = dist;
+          min_index = j;
+        }
+      }
 
-  for (int i = 0; i < detections.size(); ++i) {
-    double min_dist = 1000000;
-    int min_index = -1;
-    Eigen::Vector3d det_pos = detections[i].position;
-    for (int j = 0; j < trackers.size(); ++j) {
-      trackers[j]->age = trackers[j]->age + 1;
-      Eigen::Vector3d track_pos = trackers[j]->pos();
-      double dist = (det_pos - track_pos).norm();
-      if (dist < min_dist) {
-        min_dist = dist;
-        min_index = j;
+      if (min_dist < 0.8 && min_index >= 0 && min_index < (int)previous_p.size()) {
+        // Compute velocity from detection
+        Eigen::Vector3d vel_detect = (detections[i].position - previous_p[min_index]) / 0.02;
+        // IMM update with position and velocity measurements
+        trackers_imm[min_index]->update(detections[i].position, 0.5*vel_detect + 0.5*previous_v[min_index]);
+
+        matchedPairs.push_back(std::make_pair(i, min_index));
+
+        ObjectState state;
+        state.position = trackers_imm[min_index]->pos();
+        state.velocity = trackers_imm[min_index]->vel();
+        
+        obj_state_msgs::State statemsg;
+        statemsg.header.stamp = ros::Time::now();
+        statemsg.position.x = state.position[0]; 
+        statemsg.position.y = state.position[1]; 
+        statemsg.position.z = state.position[2];
+        statemsg.velocity.x = state.velocity[0]; 
+        statemsg.velocity.y = state.velocity[1]; 
+        statemsg.velocity.z = state.velocity[2];
+        statemsg.size.x = 0; statemsg.size.y = 0; statemsg.size.z = 0;
+        
+        // Debug: Print dominant motion model
+        // int dom_model = trackers_imm[min_index]->dominantModel();
+        // std::cout << "Object " << trackers_imm[min_index]->id << " model: " 
+        //           << (dom_model == 0 ? "CV" : (dom_model == 1 ? "CA" : "CT")) << std::endl;
+        
+        states.states.push_back(statemsg);
+      } else {
+        // Create new tracker for unmatched detection
+        std::shared_ptr<IMMEstimator> immPtr = std::make_shared<IMMEstimator>(0.02);
+        immPtr->reset(detections[i].position, id);
+        id++;
+        trackers_imm.push_back(immPtr);
       }
     }
+    statesPub.publish(states);
+    visualizeFunction(matchedPairs);
 
-    if (min_dist < 0.8) {
-      // std::cout << "id:" << trackers[min_index]->id << std::endl;
-      Eigen::Vector3d vel_detect = (detections[i].position - previous_p[min_index]) / 0.02;
-      trackers[min_index]->update(detections[i].position, 0.5*vel_detect + 0.5*previous_v[min_index] );
-
-      matchedPairs.push_back(std::make_pair(i, min_index));
-
-      ObjectState state;
-      state.position = trackers[min_index]->pos();
-      state.velocity = trackers[min_index]->vel();
-      obj_state_msgs::State statemsg;
-      statemsg.header.stamp = ros::Time::now();
-      statemsg.position.x = state.position[0]; statemsg.position.y = state.position[1]; statemsg.position.z = state.position[2];
-      statemsg.velocity.x = state.velocity[0]; statemsg.velocity.y = state.velocity[1]; statemsg.velocity.z = state.velocity[2];
-      statemsg.size.x = 0; statemsg.size.y = 0; statemsg.size.z = 0;
-      states.states.push_back(statemsg);
-
-    } else {
-      std::shared_ptr<Ekf> ekfPtr = std::make_shared<Ekf>(0.02);
-      ekfPtr->reset(detections[i].position, id);
-      id++;
-      trackers.push_back(ekfPtr);
-    }
-  }
-  statesPub.publish(states);
-
-  visualizeFunction(matchedPairs);
-
-  for (auto it = trackers.begin(); it != trackers.end();) {
-      // std::cout << "dt:" << (*it)->age - (*it)->update_num << std::endl;
+    // Remove stale trackers
+    for (auto it = trackers_imm.begin(); it != trackers_imm.end();) {
       if ((*it)->age - (*it)->update_num > 20)
-        it = trackers.erase(it);
+        it = trackers_imm.erase(it);
       else 
         it++;
-  }    
+    }
 
-  previous_p.clear();
-  previous_v.clear();
-  for (int i = 0; i < trackers.size(); ++i ) {
-    previous_p.push_back(trackers[i]->pos());
-    previous_v.push_back(trackers[i]->vel());
+    previous_p.clear();
+    previous_v.clear();
+    for (size_t i = 0; i < trackers_imm.size(); ++i) {
+      previous_p.push_back(trackers_imm[i]->pos());
+      previous_v.push_back(trackers_imm[i]->vel());
+    }
+  } else {
+    // Original EKF Tracking (fallback)
+    if(trackers_ekf.size() == 0) {
+      for(size_t i = 0; i < detections.size(); ++i) {
+        std::shared_ptr<Ekf> ekfPtr = std::make_shared<Ekf>(0.02);
+        ekfPtr->reset(detections[i].position, id);
+        id++;
+        trackers_ekf.push_back(ekfPtr);
+        previous_p.push_back(detections[i].position);
+        Eigen::Vector3d v0(0,0,0);
+        previous_v.push_back(v0);
+      }
+      return;
+    }
+
+    obj_state_msgs::ObjectsStates states;
+    std::vector<std::pair<int, int>> matchedPairs;
+
+    for (size_t i = 0; i < detections.size(); ++i) {
+      double min_dist = 1000000;
+      int min_index = -1;
+      Eigen::Vector3d det_pos = detections[i].position;
+      for (size_t j = 0; j < trackers_ekf.size(); ++j) {
+        trackers_ekf[j]->age = trackers_ekf[j]->age + 1;
+        Eigen::Vector3d track_pos = trackers_ekf[j]->pos();
+        double dist = (det_pos - track_pos).norm();
+        if (dist < min_dist) {
+          min_dist = dist;
+          min_index = j;
+        }
+      }
+
+      if (min_dist < 0.8 && min_index >= 0 && min_index < (int)previous_p.size()) {
+        Eigen::Vector3d vel_detect = (detections[i].position - previous_p[min_index]) / 0.02;
+        trackers_ekf[min_index]->update(detections[i].position, 0.5*vel_detect + 0.5*previous_v[min_index]);
+
+        matchedPairs.push_back(std::make_pair(i, min_index));
+
+        ObjectState state;
+        state.position = trackers_ekf[min_index]->pos();
+        state.velocity = trackers_ekf[min_index]->vel();
+        obj_state_msgs::State statemsg;
+        statemsg.header.stamp = ros::Time::now();
+        statemsg.position.x = state.position[0]; statemsg.position.y = state.position[1]; statemsg.position.z = state.position[2];
+        statemsg.velocity.x = state.velocity[0]; statemsg.velocity.y = state.velocity[1]; statemsg.velocity.z = state.velocity[2];
+        statemsg.size.x = 0; statemsg.size.y = 0; statemsg.size.z = 0;
+        states.states.push_back(statemsg);
+      } else {
+        std::shared_ptr<Ekf> ekfPtr = std::make_shared<Ekf>(0.02);
+        ekfPtr->reset(detections[i].position, id);
+        id++;
+        trackers_ekf.push_back(ekfPtr);
+      }
+    }
+    statesPub.publish(states);
+    visualizeFunction(matchedPairs);
+
+    for (auto it = trackers_ekf.begin(); it != trackers_ekf.end();) {
+      if ((*it)->age - (*it)->update_num > 20)
+        it = trackers_ekf.erase(it);
+      else 
+        it++;
+    }
+
+    previous_p.clear();
+    previous_v.clear();
+    for (size_t i = 0; i < trackers_ekf.size(); ++i) {
+      previous_p.push_back(trackers_ekf[i]->pos());
+      previous_v.push_back(trackers_ekf[i]->vel());
+    }
   }
+
   compTime = std::chrono::duration_cast<std::chrono::microseconds>
                     (std::chrono::high_resolution_clock::now() - tic).count() * 1.0e-3;
   std::cout << "Tracking Time Cost (ms)： " << compTime <<std::endl;
 }
 
 void MappingRos::ekfPredictCallback(const ros::TimerEvent& e) {
-  if (trackers.size() == 0)
-    return;
-
-  for (int i = 0; i < trackers.size(); ++i) {
-    double update_dt = (ros::Time::now() - trackers[i]->last_update_stamp_).toSec();
-    trackers[i]->predict();
+  // IMM or EKF prediction based on configuration
+  if (mp_->use_imm) {
+    if (trackers_imm.size() == 0)
+      return;
+    for (size_t i = 0; i < trackers_imm.size(); ++i) {
+      trackers_imm[i]->predict();
+    }
+  } else {
+    if (trackers_ekf.size() == 0)
+      return;
+    for (size_t i = 0; i < trackers_ekf.size(); ++i) {
+      trackers_ekf[i]->predict();
+    }
   }
 }
 
